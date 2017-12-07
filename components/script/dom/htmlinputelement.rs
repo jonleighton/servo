@@ -417,6 +417,22 @@ impl TextControl for HTMLInputElement {
             _ => false
         }
     }
+
+    // https://html.spec.whatwg.org/multipage/#concept-input-apply
+    //
+    // Types omitted here which could theoretically be included if they were
+    // rendered as a text control: file
+    fn has_selectable_text(&self) -> bool {
+        self.selection_api_applies() || match self.input_type() {
+            InputType::Email | InputType::Date | InputType::Month
+            | InputType::Week | InputType::Time | InputType::DatetimeLocal
+            | InputType::Number | InputType::Color => {
+                true
+            }
+
+            _ => false
+        }
+    }
 }
 
 impl HTMLInputElementMethods for HTMLInputElement {
@@ -685,6 +701,11 @@ impl HTMLInputElementMethods for HTMLInputElement {
         } else {
             self.upcast::<HTMLElement>().labels()
         }
+    }
+
+    // https://html.spec.whatwg.org/multipage/#dom-textarea/input-select
+    fn Select(&self) {
+        self.dom_select();
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-textarea/input-selectionstart
