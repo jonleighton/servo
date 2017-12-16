@@ -244,7 +244,7 @@ pub trait TextControl: DerivedFrom<EventTarget> + DerivedFrom<Node> {
     }
 
     fn selection_direction(&self) -> SelectionDirection {
-        self.textinput().borrow().selection_direction
+        self.textinput().borrow().selection_direction()
     }
 
     // https://html.spec.whatwg.org/multipage/#set-the-selection-range
