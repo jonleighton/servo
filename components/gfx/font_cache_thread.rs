@@ -35,12 +35,6 @@ pub struct FontTemplates {
     templates: Vec<FontTemplate>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct FontTemplateInfo {
-    pub font_template: Arc<FontTemplateData>,
-    pub font_key: webrender_api::FontKey,
-}
-
 impl FontTemplates {
     pub fn new() -> FontTemplates {
         FontTemplates {
@@ -108,7 +102,7 @@ impl FontTemplates {
 pub enum Command {
     GetFontTemplate(SingleFontFamily, FontTemplateDescriptor, IpcSender<Reply>),
     GetLastResortFontTemplate(FontTemplateDescriptor, IpcSender<Reply>),
-    GetFontInstance(webrender_api::FontKey, Au, IpcSender<webrender_api::FontInstanceKey>),
+    GetWebrenderKey(Arc<FontTemplateData>, Au, IpcSender<webrender_api::FontInstanceKey>),
     AddWebFont(LowercaseString, EffectiveSources, IpcSender<()>),
     AddDownloadedWebFont(LowercaseString, ServoUrl, Vec<u8>, IpcSender<()>),
     Exit(IpcSender<()>),
@@ -118,7 +112,7 @@ pub enum Command {
 /// Reply messages sent from the font cache thread to the FontContext caller.
 #[derive(Debug, Deserialize, Serialize)]
 pub enum Reply {
-    GetFontTemplateReply(Option<FontTemplateInfo>),
+    GetFontTemplateReply(Option<Arc<FontTemplateData>>),
 }
 
 /// The font cache thread itself. It maintains a list of reference counted
@@ -177,25 +171,8 @@ impl FontCache {
                     let font_template = self.last_resort_font_template(&descriptor);
                     let _ = result.send(Reply::GetFontTemplateReply(Some(font_template)));
                 }
-                Command::GetFontInstance(font_key, size, result) => {
-                    let webrender_api = &self.webrender_api;
-
-                    let instance_key = *self.font_instances
-                                            .entry((font_key, size))
-                                            .or_insert_with(|| {
-                                                let key = webrender_api.generate_font_instance_key();
-                                                let mut updates = webrender_api::ResourceUpdates::new();
-                                                updates.add_font_instance(key,
-                                                                          font_key,
-                                                                          size,
-                                                                          None,
-                                                                          None,
-                                                                          Vec::new());
-                                                webrender_api.update_resources(updates);
-                                                key
-                                            });
-
-                    let _ = result.send(instance_key);
+                Command::GetWebrenderKey(template, size, result) => {
+                    let _ = result.send(self.webrender_key(template, size));
                 }
                 Command::AddWebFont(family_name, sources, result) => {
                     self.handle_add_web_font(family_name, sources, result);
@@ -366,11 +343,38 @@ impl FontCache {
         }
     }
 
-    fn get_font_template_info(&mut self, template: Arc<FontTemplateData>) -> FontTemplateInfo {
-        let webrender_api = &self.webrender_api;
-        let webrender_fonts = &mut self.webrender_fonts;
+    fn find_font_template(
+        &mut self,
+        family: &SingleFontFamily,
+        desc: &FontTemplateDescriptor,
+    ) -> Option<Arc<FontTemplateData>>
+    {
+        self.find_font_in_web_family(family, desc)
+            .or_else(|| {
+                let transformed_family = self.transform_family(family);
+                self.find_font_in_local_family(&transformed_family, desc)
+            })
+    }
 
-        let font_key = *webrender_fonts.entry(template.identifier.clone()).or_insert_with(|| {
+    fn last_resort_font_template(&mut self, desc: &FontTemplateDescriptor) -> Arc<FontTemplateData> {
+        let last_resort = last_resort_font_families();
+
+        for family in &last_resort {
+            let family = LowercaseString::new(family);
+            let font = self.find_font_in_local_family(&family, desc);
+
+            if font.is_some() {
+                return font.unwrap()
+            }
+        }
+
+        panic!("Unable to find any fonts that match (do you have fallback fonts installed?)");
+    }
+
+    fn webrender_key(&mut self, template: Arc<FontTemplateData>, size: Au) -> webrender_api::FontInstanceKey {
+        let webrender_api = &self.webrender_api;
+
+        let font_key = *self.webrender_fonts.entry(template.identifier.clone()).or_insert_with(|| {
             let font_key = webrender_api.generate_font_key();
             let mut updates = webrender_api::ResourceUpdates::new();
             match (template.bytes_if_in_memory(), template.native_font()) {
@@ -382,38 +386,20 @@ impl FontCache {
             font_key
         });
 
-        FontTemplateInfo {
-            font_template: template,
-            font_key: font_key,
-        }
-    }
-
-    fn find_font_template(&mut self, family: &SingleFontFamily, desc: &FontTemplateDescriptor)
-                            -> Option<FontTemplateInfo> {
-        let template = self.find_font_in_web_family(family, desc)
-            .or_else(|| {
-                let transformed_family = self.transform_family(family);
-                self.find_font_in_local_family(&transformed_family, desc)
-            });
-
-        template.map(|template| {
-            self.get_font_template_info(template)
-        })
-    }
-
-    fn last_resort_font_template(&mut self, desc: &FontTemplateDescriptor)
-                                        -> FontTemplateInfo {
-        let last_resort = last_resort_font_families();
-
-        for family in &last_resort {
-            let family = LowercaseString::new(family);
-            let maybe_font_in_family = self.find_font_in_local_family(&family, desc);
-            if let Some(family) = maybe_font_in_family {
-                return self.get_font_template_info(family)
-            }
-        }
-
-        panic!("Unable to find any fonts that match (do you have fallback fonts installed?)");
+        *self.font_instances
+            .entry((font_key, size))
+            .or_insert_with(|| {
+                let key = webrender_api.generate_font_instance_key();
+                let mut updates = webrender_api::ResourceUpdates::new();
+                updates.add_font_instance(key,
+                                          font_key,
+                                          size,
+                                          None,
+                                          None,
+                                          Vec::new());
+                webrender_api.update_resources(updates);
+                key
+            })
     }
 }
 
@@ -468,10 +454,10 @@ impl FontCacheThread {
 }
 
 impl FontSource for FontCacheThread {
-    fn get_font_instance(&mut self, key: webrender_api::FontKey, size: Au) -> webrender_api::FontInstanceKey {
+    fn webrender_key(&mut self, template: Arc<FontTemplateData>, size: Au) -> webrender_api::FontInstanceKey {
         let (response_chan, response_port) =
             ipc::channel().expect("failed to create IPC channel");
-        self.chan.send(Command::GetFontInstance(key, size, response_chan))
+        self.chan.send(Command::GetWebrenderKey(template, size, response_chan))
             .expect("failed to send message to font cache thread");
 
         let instance_key = response_port.recv();
@@ -483,8 +469,12 @@ impl FontSource for FontCacheThread {
         instance_key.unwrap()
     }
 
-    fn find_font_template(&mut self, family: SingleFontFamily, desc: FontTemplateDescriptor)
-                                                -> Option<FontTemplateInfo> {
+    fn find_font_template(
+        &mut self,
+        family: SingleFontFamily,
+        desc: FontTemplateDescriptor,
+    ) -> Option<Arc<FontTemplateData>>
+    {
         let (response_chan, response_port) =
             ipc::channel().expect("failed to create IPC channel");
         self.chan.send(Command::GetFontTemplate(family, desc, response_chan))
@@ -505,8 +495,7 @@ impl FontSource for FontCacheThread {
         }
     }
 
-    fn last_resort_font_template(&mut self, desc: FontTemplateDescriptor)
-                                                -> FontTemplateInfo {
+    fn last_resort_font_template(&mut self, desc: FontTemplateDescriptor) -> Arc<FontTemplateData> {
         let (response_chan, response_port) =
             ipc::channel().expect("failed to create IPC channel");
         self.chan.send(Command::GetLastResortFontTemplate(desc, response_chan))
