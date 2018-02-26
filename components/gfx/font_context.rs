@@ -4,14 +4,13 @@
 
 use app_units::Au;
 use fnv::FnvHasher;
-use font::{Font, FontDescriptor, FontGroup, FontHandleMethods, FontRef};
+use font::{Font, FontDescriptor, FontFamilyDescriptor, FontGroup, FontHandleMethods, FontRef};
 use font_template::FontTemplateDescriptor;
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use platform::font::FontHandle;
 use platform::font_template::FontTemplateData;
 pub use platform::font_context::FontContextHandle;
 use servo_arc::Arc as ServoArc;
-use servo_atoms::Atom;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::default::Default;
@@ -21,25 +20,24 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
 use style::computed_values::font_variant_caps::T as FontVariantCaps;
 use style::properties::style_structs::Font as FontStyleStruct;
-use style::values::computed::font::SingleFontFamily;
 use webrender_api;
 
 static SMALL_CAPS_SCALE_FACTOR: f32 = 0.8;      // Matches FireFox (see gfxFont.h)
 
 #[derive(Debug)]
 struct FontCacheEntry {
-    family: Atom,
+    family_descriptor: FontFamilyDescriptor,
     font: Option<FontRef>,
 }
 
 impl FontCacheEntry {
-    fn matches(&self, descriptor: &FontDescriptor, family: &SingleFontFamily) -> bool {
-        if self.family != *family.atom() {
+    fn matches(&self, font_descriptor: &FontDescriptor, family_descriptor: &FontFamilyDescriptor) -> bool {
+        if self.family_descriptor != *family_descriptor {
             return false
         }
 
         if let Some(ref font) = self.font {
-            (*font).borrow().descriptor == *descriptor
+            (*font).borrow().descriptor == *font_descriptor
         } else {
             true
         }
@@ -47,13 +45,79 @@ impl FontCacheEntry {
 }
 
 #[derive(Debug)]
-struct FallbackFontCacheEntry {
-    font: FontRef,
-}
+struct FontCache(Vec<FontCacheEntry>);
 
-impl FallbackFontCacheEntry {
-    fn matches(&self, descriptor: &FontDescriptor) -> bool {
-        self.font.borrow().descriptor == *descriptor
+impl FontCache {
+    fn new() -> FontCache {
+        FontCache(vec!())
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn get<S: FontSource>(
+        &mut self,
+        platform_handle: &FontContextHandle,
+        font_source: &mut S,
+        font_descriptor: &FontDescriptor,
+        family_descriptor: &FontFamilyDescriptor,
+    ) -> Option<FontRef>
+    {
+        if let Some(entry) = self.0.iter().find(|entry| entry.matches(font_descriptor, family_descriptor)) {
+            return entry.font.clone()
+        }
+
+        let font =
+            font_source.font_template(
+                font_descriptor.template_descriptor.clone(),
+                (*family_descriptor).clone(),
+            )
+            .and_then(|template| {
+                self.create_font(
+                    platform_handle,
+                    font_source,
+                    template,
+                    font_descriptor.to_owned()
+                ).ok()
+            })
+            .map(|font| Rc::new(RefCell::new(font)));
+
+        self.0.push(FontCacheEntry {
+            family_descriptor: (*family_descriptor).clone(),
+            font: font.clone(),
+        });
+
+        font
+    }
+
+    /// Create a `Font` for use in layout calculations, from a `FontTemplateData` returned by the
+    /// cache thread and a `FontDescriptor` which contains the styling parameters.
+    fn create_font<S: FontSource>(
+        &self,
+        platform_handle: &FontContextHandle,
+        font_source: &mut S,
+        template: Arc<FontTemplateData>,
+        descriptor: FontDescriptor
+    ) -> Result<Font, ()>
+    {
+        // TODO: (Bug #3463): Currently we only support fake small-caps
+        // painting. We should also support true small-caps (where the
+        // font supports it) in the future.
+        let actual_pt_size = match descriptor.variant {
+            FontVariantCaps::SmallCaps => descriptor.pt_size.scale_by(SMALL_CAPS_SCALE_FACTOR),
+            FontVariantCaps::Normal => descriptor.pt_size,
+        };
+
+        let handle = FontHandle::new_from_template(
+            platform_handle,
+            template.clone(),
+            Some(actual_pt_size)
+        )?;
+
+        let webrender_key = font_source.webrender_key(template, actual_pt_size);
+
+        Ok(Font::new(handle, descriptor.to_owned(), actual_pt_size, webrender_key))
     }
 }
 
@@ -64,13 +128,11 @@ static FONT_CACHE_EPOCH: AtomicUsize = ATOMIC_USIZE_INIT;
 pub trait FontSource {
     fn webrender_key(&mut self, template: Arc<FontTemplateData>, size: Au) -> webrender_api::FontInstanceKey;
 
-    fn find_font_template(
+    fn font_template(
         &mut self,
-        family: SingleFontFamily,
-        desc: FontTemplateDescriptor,
+        template_descriptor: FontTemplateDescriptor,
+        family_descriptor: FontFamilyDescriptor,
     ) -> Option<Arc<FontTemplateData>>;
-
-    fn last_resort_font_template(&mut self, desc: FontTemplateDescriptor) -> Arc<FontTemplateData>;
 }
 
 /// The FontContext represents the per-thread/thread state necessary for
@@ -87,8 +149,8 @@ pub struct FontContext<S: FontSource> {
     // See bug https://github.com/servo/servo/issues/3300
     //
     // GWTODO: Check on real pages if this is faster as Vec() or HashMap().
-    font_cache: Vec<FontCacheEntry>,
-    fallback_font_cache: Vec<FallbackFontCacheEntry>,
+    font_cache: FontCache,
+    fallback_font_cache: FontCache,
 
     font_group_cache:
         HashMap<FontGroupCacheKey, Rc<RefCell<FontGroup>>, BuildHasherDefault<FnvHasher>>,
@@ -102,33 +164,11 @@ impl<S: FontSource> FontContext<S> {
         FontContext {
             platform_handle: handle,
             font_source,
-            font_cache: vec!(),
-            fallback_font_cache: vec!(),
+            font_cache: FontCache::new(),
+            fallback_font_cache: FontCache::new(),
             font_group_cache: HashMap::with_hasher(Default::default()),
             epoch: 0,
         }
-    }
-
-    /// Create a `Font` for use in layout calculations, from a `FontTemplateData` returned by the
-    /// cache thread and a `FontDescriptor` which contains the styling parameters.
-    fn create_font(&mut self, template: Arc<FontTemplateData>, descriptor: FontDescriptor) -> Result<Font, ()> {
-        // TODO: (Bug #3463): Currently we only support fake small-caps
-        // painting. We should also support true small-caps (where the
-        // font supports it) in the future.
-        let actual_pt_size = match descriptor.variant {
-            FontVariantCaps::SmallCaps => descriptor.pt_size.scale_by(SMALL_CAPS_SCALE_FACTOR),
-            FontVariantCaps::Normal => descriptor.pt_size,
-        };
-
-        let handle = FontHandle::new_from_template(
-            &self.platform_handle,
-            template.clone(),
-            Some(actual_pt_size)
-        )?;
-
-        let webrender_key = self.font_source.webrender_key(template, actual_pt_size);
-
-        Ok(Font::new(handle, descriptor.to_owned(), actual_pt_size, webrender_key))
     }
 
     fn expire_font_caches_if_necessary(&mut self) {
@@ -163,74 +203,26 @@ impl<S: FontSource> FontContext<S> {
         font_group
     }
 
-    /// Returns a reference to an existing font cache entry matching `descriptor` and `family`, if
-    /// there is one.
-    fn font_cache_entry(&self, descriptor: &FontDescriptor, family: &SingleFontFamily) -> Option<&FontCacheEntry> {
-        self.font_cache.iter()
-            .find(|cache_entry| cache_entry.matches(&descriptor, &family))
+    /// Returns a font matching the parameters. Fonts are cached, so repeated calls will return a
+    /// reference to the same underlying `Font`.
+    pub fn font(
+        &mut self,
+        font_descriptor: &FontDescriptor,
+        family_descriptor: &FontFamilyDescriptor,
+    ) -> Option<FontRef>
+    {
+        self.font_cache.get(&self.platform_handle, &mut self.font_source, font_descriptor, family_descriptor)
     }
 
-    /// Creates a new font cache entry matching `descriptor` and `family`.
-    fn create_font_cache_entry(&mut self, descriptor: &FontDescriptor, family: &SingleFontFamily) -> FontCacheEntry {
-        let font =
-            self.font_source.find_font_template(family.clone(), descriptor.template_descriptor.clone())
-                .and_then(|template| self.create_font(template, descriptor.to_owned()).ok())
-                .map(|font| Rc::new(RefCell::new(font)));
-
-        FontCacheEntry { family: family.atom().to_owned(), font }
-    }
-
-    /// Returns a font from `family` matching the `descriptor`. Fonts are cached, so repeated calls
-    /// will return a reference to the same underlying `Font`.
-    pub fn font(&mut self, descriptor: &FontDescriptor, family: &SingleFontFamily) -> Option<FontRef> {
-        if let Some(entry) = self.font_cache_entry(descriptor, family) {
-            return entry.font.clone()
-        }
-
-        let entry = self.create_font_cache_entry(descriptor, family);
-        let font = entry.font.clone();
-        self.font_cache.push(entry);
-        font
-    }
-
-    /// Returns a reference to an existing fallback font cache entry matching `descriptor`, if
-    /// there is one.
-    fn fallback_font_cache_entry(&self, descriptor: &FontDescriptor) -> Option<&FallbackFontCacheEntry> {
-        self.fallback_font_cache.iter()
-            .find(|cache_entry| cache_entry.matches(descriptor))
-    }
-
-    /// Creates a new fallback font cache entry matching `descriptor`.
-    fn create_fallback_font_cache_entry(&mut self, descriptor: &FontDescriptor) -> Option<FallbackFontCacheEntry> {
-        let template = self.font_source.last_resort_font_template(descriptor.template_descriptor.clone());
-
-        match self.create_font(template, descriptor.to_owned()) {
-            Ok(font) =>
-                Some(FallbackFontCacheEntry {
-                    font: Rc::new(RefCell::new(font))
-                }),
-
-            Err(_) => {
-                debug!("Failed to create fallback font!");
-                None
-            }
-        }
-    }
-
-    /// Returns a fallback font matching the `descriptor`. Fonts are cached, so repeated calls will
-    /// return a reference to the same underlying `Font`.
-    pub fn fallback_font(&mut self, descriptor: &FontDescriptor) -> Option<FontRef> {
-        if let Some(cached_entry) = self.fallback_font_cache_entry(descriptor) {
-            return Some(cached_entry.font.clone())
-        };
-
-        if let Some(entry) = self.create_fallback_font_cache_entry(descriptor) {
-            let font = entry.font.clone();
-            self.fallback_font_cache.push(entry);
-            Some(font)
-        } else {
-            None
-        }
+    /// Returns a font matching the parameters. Fallback fonts are cached (separately to normal
+    /// fonts), so repeated calls will return a reference to the same underlying `Font`.
+    pub fn fallback_font(
+        &mut self,
+        font_descriptor: &FontDescriptor,
+        family_descriptor: &FontFamilyDescriptor,
+    ) -> Option<FontRef>
+    {
+        self.fallback_font_cache.get(&self.platform_handle, &mut self.font_source, font_descriptor, family_descriptor)
     }
 }
 

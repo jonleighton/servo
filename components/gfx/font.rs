@@ -9,6 +9,7 @@ use font_template::FontTemplateDescriptor;
 use ordered_float::NotNaN;
 use platform::font::{FontHandle, FontTable};
 use platform::font_context::FontContextHandle;
+use platform::font_list::fallback_font_families;
 use platform::font_template::FontTemplateData;
 use servo_atoms::Atom;
 use smallvec::SmallVec;
@@ -331,7 +332,7 @@ impl FontGroup {
 
         let families =
             style.font_family.0.iter()
-                .map(|family| FontGroupFamily::new(descriptor.clone(), family.clone()))
+                .map(|family| FontGroupFamily::new(descriptor.clone(), &family))
                 .collect();
 
         FontGroup { descriptor, families }
@@ -346,15 +347,20 @@ impl FontGroup {
         mut font_context: &mut FontContext<S>,
         codepoint: char
     ) -> Option<FontRef> {
-        self.find(&mut font_context, |font| font.borrow().has_glyph_for(codepoint))
+        let has_glyph = |font: &FontRef| font.borrow().has_glyph_for(codepoint);
+
+        self.find(&mut font_context, |font| has_glyph(font))
+            .or_else(|| self.find_fallback(&mut font_context, Some(codepoint), has_glyph))
             .or_else(|| self.first(&mut font_context))
     }
 
+    /// Find the first available font in the group, or the first available fallback font.
     pub fn first<S: FontSource>(
         &mut self,
         mut font_context: &mut FontContext<S>
     ) -> Option<FontRef> {
         self.find(&mut font_context, |_| true)
+            .or_else(|| self.find_fallback(&mut font_context, None, |_| true))
     }
 
     /// Find a font which returns true for `predicate`. This method mutates because we may need to
@@ -362,19 +368,36 @@ impl FontGroup {
     fn find<S, P>(
         &mut self,
         mut font_context: &mut FontContext<S>,
-        mut predicate: P
+        predicate: P,
     ) -> Option<FontRef>
     where
         S: FontSource,
-        P: FnMut(&FontRef) -> bool
+        P: FnMut(&FontRef) -> bool,
     {
         self.families.iter_mut()
             .filter_map(|family| family.font(&mut font_context))
-            .find(|f| predicate(f))
-            .or_else(|| {
-                font_context.fallback_font(&self.descriptor)
-                    .into_iter().find(predicate)
+            .find(predicate)
+    }
+
+    fn find_fallback<S, P>(
+        &mut self,
+        font_context: &mut FontContext<S>,
+        codepoint: Option<char>,
+        predicate: P,
+    ) -> Option<FontRef>
+    where
+        S: FontSource,
+        P: FnMut(&FontRef) -> bool,
+    {
+        fallback_font_families(codepoint).iter()
+            .map(|family| {
+                 FontFamilyDescriptor::new(
+                     FontFamilyName::from(*family),
+                     FontSearchScope::System,
+                 )
             })
+            .filter_map(|family| font_context.fallback_font(&self.descriptor, &family))
+            .find(predicate)
     }
 }
 
@@ -383,17 +406,22 @@ impl FontGroup {
 /// only if actually needed.
 #[derive(Debug)]
 struct FontGroupFamily {
-    descriptor: FontDescriptor,
-    family: SingleFontFamily,
+    font_descriptor: FontDescriptor,
+    family_descriptor: FontFamilyDescriptor,
     loaded: bool,
     font: Option<FontRef>,
 }
 
 impl FontGroupFamily {
-    fn new(descriptor: FontDescriptor, family: SingleFontFamily) -> FontGroupFamily {
+    fn new(font_descriptor: FontDescriptor, family: &SingleFontFamily) -> FontGroupFamily {
+        let family_descriptor = FontFamilyDescriptor::new(
+            FontFamilyName::from(family),
+            FontSearchScope::Any
+        );
+
         FontGroupFamily {
-            descriptor,
-            family,
+            font_descriptor,
+            family_descriptor,
             loaded: false,
             font: None,
         }
@@ -404,7 +432,7 @@ impl FontGroupFamily {
     /// subsequent calls.
     fn font<S: FontSource>(&mut self, font_context: &mut FontContext<S>) -> Option<FontRef> {
         if !self.loaded {
-            self.font = font_context.font(&self.descriptor, &self.family);
+            self.font = font_context.font(&self.font_descriptor, &self.family_descriptor);
             self.loaded = true;
         }
 
@@ -444,4 +472,64 @@ pub fn get_and_reset_text_shaping_performance_counter() -> usize {
     let value = TEXT_SHAPING_PERFORMANCE_COUNTER.load(Ordering::SeqCst);
     TEXT_SHAPING_PERFORMANCE_COUNTER.store(0, Ordering::SeqCst);
     value
+}
+
+/// The scope within which we will look for a font.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum FontSearchScope {
+    /// All fonts will be searched, including those specified via `@font-face` rules.
+    Any,
+
+    /// Only system fonts will be searched.
+    System,
+}
+
+/// A font family name used in font selection.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub enum FontFamilyName {
+    /// A specific name such as `"Arial"`
+    Specific(Atom),
+
+    /// A generic name such as `sans-serif`
+    Generic(Atom),
+}
+
+impl FontFamilyName {
+    pub fn name(&self) -> &str {
+        match *self {
+            FontFamilyName::Specific(ref name) => name,
+            FontFamilyName::Generic(ref name) => name,
+        }
+    }
+}
+
+impl<'a> From<&'a SingleFontFamily> for FontFamilyName {
+    fn from(other: &'a SingleFontFamily) -> FontFamilyName {
+        match *other {
+            SingleFontFamily::FamilyName(ref family_name) =>
+                FontFamilyName::Specific(family_name.name.clone()),
+
+            SingleFontFamily::Generic(ref generic_name) =>
+                FontFamilyName::Generic(generic_name.clone()),
+        }
+    }
+}
+
+impl<'a> From<&'a str> for FontFamilyName {
+    fn from(other: &'a str) -> FontFamilyName {
+        FontFamilyName::Specific(Atom::from(other))
+    }
+}
+
+/// The font family parameters for font selection.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FontFamilyDescriptor {
+    pub name: FontFamilyName,
+    pub scope: FontSearchScope,
+}
+
+impl FontFamilyDescriptor {
+    fn new(name: FontFamilyName, scope: FontSearchScope) -> FontFamilyDescriptor {
+        FontFamilyDescriptor { name, scope }
+    }
 }
