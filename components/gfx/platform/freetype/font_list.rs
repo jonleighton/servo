@@ -152,5 +152,10 @@ pub fn fallback_font_families(codepoint: Option<char>) -> Vec<&'static str> {
         }
     }
 
+    // TODO: We could conditionally push this onto the start of the list only where needed if we
+    //       made the ucd lib able to determine emoji codepoints.
+    families.push("Emoji One");
+    families.push("Noto Color Emoji");
+
     families
 }
